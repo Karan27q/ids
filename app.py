@@ -7,6 +7,62 @@ import numpy as np
 import pandas as pd
 import joblib
 from tensorflow.keras.models import load_model
+import tensorflow as tf
+from tensorflow.keras.layers import Dense as KerasDense
+from tensorflow.keras.layers import TimeDistributed as KerasTimeDistributed
+import json
+import h5py
+
+# Workaround for models saved with newer/quantized Keras layers: some configs
+# include `quantization_config` which older deserializers don't accept.
+# Provide a Dense subclass that strips that key from config during deserialization.
+class DenseNoQuant(KerasDense):
+    @classmethod
+    def from_config(cls, config):
+        config.pop("quantization_config", None)
+        return super().from_config(config)
+
+
+# TimeDistributed may wrap layers whose configs include `quantization_config`.
+# Ensure nested configs are stripped before deserialization.
+class TimeDistributedNoQuant(KerasTimeDistributed):
+    @classmethod
+    def from_config(cls, config):
+        def strip_quant(obj):
+            if isinstance(obj, dict):
+                obj.pop("quantization_config", None)
+                for v in obj.values():
+                    strip_quant(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    strip_quant(item)
+        strip_quant(config)
+        return super().from_config(config)
+
+
+def _strip_quant_from_h5(path):
+    try:
+        with h5py.File(path, "r+") as f:
+            # Keras HDF5 stores the model config as a JSON string in attrs['model_config']
+            if "model_config" in f.attrs:
+                cfg = f.attrs["model_config"]
+                if isinstance(cfg, (bytes, bytearray)):
+                    cfg = cfg.decode("utf-8")
+                data = json.loads(cfg)
+
+                def _rec_strip(o):
+                    if isinstance(o, dict):
+                        o.pop("quantization_config", None)
+                        for v in o.values():
+                            _rec_strip(v)
+                    elif isinstance(o, list):
+                        for item in o:
+                            _rec_strip(item)
+
+                _rec_strip(data)
+                f.attrs["model_config"] = json.dumps(data)
+    except Exception:
+        pass
 import time
 import plotly.express as px
 import plotly.graph_objects as go
@@ -14,6 +70,17 @@ from plotly.subplots import make_subplots
 import random
 import uuid
 from datetime import datetime, timedelta
+import sys, os
+
+# ensure local `src` package is importable (utils.py lives in ./src)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+try:
+    from utils import render_alert_badge, stream_simulation, evaluate_models
+except Exception:
+    # fall back silently if utils cannot be imported (will still run existing app)
+    render_alert_badge = None
+    stream_simulation = None
+    evaluate_models = None
 
 # =============================================================================
 # DARK THEME & SOC STYLING
@@ -138,8 +205,14 @@ def _get_label_col(df):
 @st.cache_resource
 def load_assets():
     scaler = joblib.load("scaler.save")
-    autoencoder = load_model("lstm_autoencoder.keras")
-    classifier = load_model("attack_classifier.keras")
+    # Strip `quantization_config` keys from saved model JSON (HDF5 .keras files)
+    # before deserializing so older TF/Keras runtimes can load them.
+    for p in ("lstm_autoencoder.h5", "attack_classifier.h5"):
+        _strip_quant_from_h5(p)
+
+    custom_objs = {"Dense": DenseNoQuant, "TimeDistributed": TimeDistributedNoQuant}
+    autoencoder = load_model("lstm_autoencoder.h5", custom_objects=custom_objs, compile=False)
+    classifier = load_model("attack_classifier.h5", custom_objects=custom_objs, compile=False)
     return scaler, autoencoder, classifier
 
 scaler, autoencoder, classifier = load_assets()
@@ -188,6 +261,66 @@ with st.sidebar:
     st.markdown("---")
     auto_refresh = st.checkbox("Auto-refresh (5s)", value=st.session_state.auto_mode)
     st.session_state.auto_mode = auto_refresh
+    st.markdown("---")
+    st.subheader("Model Evaluation")
+    eval_file = st.file_uploader("Evaluation CSV", type=["csv"], key="eval_csv")
+    if st.button("Run Model Evaluation"):
+        if evaluate_models is None:
+            st.warning("Model evaluation utility not available.")
+        elif eval_file is None:
+            st.warning("Upload a CSV file to run evaluation.")
+        else:
+            with st.spinner("Evaluating models..."):
+                try:
+                    # Use current app directory for model files (models live alongside app.py)
+                    models_dir = os.path.dirname(__file__)
+                    # Read uploaded CSV to detect which columns are present
+                    try:
+                        eval_df = pd.read_csv(eval_file)
+                        # reset file pointer for downstream readers
+                        try:
+                            eval_file.seek(0)
+                        except Exception:
+                            pass
+                    except Exception:
+                        eval_df = None
+
+                    fcols = None
+                    missing = []
+                    if eval_df is not None and 'feature_names' in globals():
+                        # Map normalized column names to actual csv columns
+                        csv_cols = {_normalize_col(c): c for c in eval_df.columns}
+                        matched = []
+                        for feat in feature_names.tolist():
+                            if feat in eval_df.columns:
+                                matched.append(feat)
+                            else:
+                                key = _normalize_col(feat)
+                                if key in csv_cols:
+                                    matched.append(csv_cols[key])
+                                else:
+                                    missing.append(feat)
+                        if matched:
+                            fcols = matched
+                    # If no matched feature columns, let evaluate_models auto-detect numeric features
+                    if missing:
+                        st.warning(f"Evaluation: {len(missing)} expected features not found in CSV (showing first 10): {missing[:10]}")
+
+                    results = evaluate_models(models_dir, eval_file, feature_columns=fcols)
+                    st.success("Evaluation complete")
+                    st.session_state.last_evaluation = results
+                    # Show key metrics prominently and allow download
+                    metrics = results.get("metrics", {})
+                    if metrics:
+                        st.write("**Evaluation Metrics**")
+                        for k, v in metrics.items():
+                            st.write(f"- {k}: {v}")
+                    else:
+                        st.info("No labeled metrics produced; see raw results below.")
+                    st.json(results)
+                    st.download_button("Download Evaluation Results (JSON)", data=json.dumps(results, default=list), file_name="evaluation_results.json", mime="application/json")
+                except Exception as e:
+                    st.error(f"Evaluation failed: {e}")
 
 def get_features():
     """Returns features; in Random mode sometimes (features, severity) to force Critical/High alerts."""
@@ -337,20 +470,26 @@ if data_source == "Upload CSV" and uploaded_file is not None:
                 st.caption("📌 CSV has a Label column: rows labeled as attack will always appear as alerts.")
             progress_bar = st.progress(0, text="Scanning logs...")
             alerts_from_csv = 0
+            processed_rows = []
             for i in range(n_rows):
                 try:
                     feats = df_csv.iloc[i].values.astype(float)
                     if len(feats) == n_features:
                         csv_label = df_raw.iloc[i][label_col] if has_label else None
                         entry = run_prediction(features=feats, label_override=csv_label)
-                        if entry and entry.get("alert"):
-                            alerts_from_csv += 1
+                        if entry:
+                            # track per-row processed entries for later review/download
+                            processed_rows.append(entry)
+                            if entry.get("alert"):
+                                alerts_from_csv += 1
                 except Exception:
                     pass
                 progress_bar.progress((i + 1) / n_rows, text=f"Scanning... {i+1}/{n_rows} | Threats: {alerts_from_csv}")
             progress_bar.empty()
-        st.session_state.last_processed_csv_name = file_name
-        st.session_state.last_csv_result = {"file": file_name, "rows": n_rows, "alerts": alerts_from_csv}
+            st.session_state.last_processed_csv_name = file_name
+            st.session_state.last_csv_result = {"file": file_name, "rows": n_rows, "alerts": alerts_from_csv}
+            # save processed rows (as list of dicts) for UI preview and download
+            st.session_state.last_csv_entries = processed_rows
         try:
             st.toast(f"Analysis complete. {alerts_from_csv} threat(s) from {n_rows} entries.", icon="🛡️")
         except Exception:
@@ -374,14 +513,35 @@ with col_h2:
 if st.session_state.get("last_csv_result"):
     r = st.session_state.last_csv_result
     st.info(f"📁 **Last log file analyzed:** `{r['file']}` — **{r['alerts']}** threat(s) detected from **{r['rows']}** log entries. Review the Live Threat Feed and Incident Queue below.")
+    # Show processed CSV preview and allow download
+    if st.session_state.get("last_csv_entries"):
+        try:
+            df_last = pd.DataFrame(st.session_state.last_csv_entries)
+            with st.expander("Preview processed CSV results (last upload)"):
+                st.dataframe(df_last.head(50), use_container_width=True)
+                csv_data = df_last.to_csv(index=False)
+                st.download_button("Download processed results CSV", data=csv_data, file_name=f"processed_{r['file']}", mime="text/csv")
+                # attempt to persist a copy alongside the app (best-effort)
+                try:
+                    out_path = os.path.join(os.path.dirname(__file__), f"processed_{r['file']}")
+                    df_last.to_csv(out_path, index=False)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 # Critical alert banner
 alerts = [h for h in st.session_state.history if h["alert"]]
 critical_alerts = [a for a in alerts if a.get("severity") == "Critical"]
 if critical_alerts:
+    # If `render_alert_badge` is available use it for a compact badge, keep pulse banner for visibility
+    try:
+        badge_html = render_alert_badge("Critical") if render_alert_badge else ""
+    except Exception:
+        badge_html = ""
     st.markdown(
         f'<div class="pulse-critical" style="background:#f85149;color:white;padding:12px 20px;border-radius:8px;margin-bottom:1.5rem;font-weight:600;">'
-        f'⚠️ CRITICAL THREAT DETECTED — {len(critical_alerts)} critical alert(s) require immediate attention</div>',
+        f'⚠️ CRITICAL THREAT DETECTED — {len(critical_alerts)} critical alert(s) require immediate attention {badge_html}</div>',
         unsafe_allow_html=True
     )
 

@@ -10,3 +10,22 @@ __pycache__/
 
 # VS Code settings
 .vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local editor/temp files
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Data, models, and generated artifacts
+*.h5
+*.keras
+*.save
+*.npy
+*.csv
+
+# Optional dependency lock files (local/tool-specific)
+uv.lock
